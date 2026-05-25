@@ -153,7 +153,11 @@ class OracleMCPServer {
 
     this.setupHandlers();
     this.setupErrorHandling();
-    this.verifyVectorHealth();
+    // NOTE: verifyVectorHealth() is intentionally NOT called here. The vector
+    // store hasn't connected yet — calling getStats() pre-connect always
+    // returns count=0 ("Connected but collection empty" spurious warning).
+    // main() invokes it AFTER preConnectVector() to get an accurate count.
+    // (glueboy-oracle#59 diagnostic 2026-05-25.)
   }
 
   /** Build ToolContext from server state */
@@ -330,6 +334,11 @@ class OracleMCPServer {
     await this.vectorStore.connect();
   }
 
+  /** Public so main() can call it after preConnectVector completes (race fix glueboy-oracle#59). */
+  async runVectorHealthCheck(): Promise<void> {
+    await this.verifyVectorHealth();
+  }
+
   async run(): Promise<void> {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
@@ -347,6 +356,8 @@ async function runHealthcheck(): Promise<void> {
   try {
     const server = new OracleMCPServer({ readOnly: true });
     await withToolTimeout(server.preConnectVector(), 'healthcheck.preConnectVector', HEALTHCHECK_TIMEOUT_MS);
+    // Health check now reports accurate doc count (post-race-fix glueboy-oracle#59).
+    await withToolTimeout(server.runVectorHealthCheck(), 'healthcheck.runVectorHealthCheck', HEALTHCHECK_TIMEOUT_MS);
     console.log('arra-oracle MCP healthcheck: OK');
     process.exit(0);
   } catch (e) {
@@ -368,6 +379,9 @@ async function main() {
     console.error('[Startup] Pre-connecting to vector store...');
     await server.preConnectVector();
     console.error('[Startup] Vector store pre-connected successfully');
+    // Now safe to verify health (vector store is connected).
+    // Was previously called from constructor, which raced ahead of preConnect.
+    await server.runVectorHealthCheck();
   } catch (e) {
     console.error('[Startup] Vector store pre-connect failed:', e instanceof Error ? e.message : e);
   }
