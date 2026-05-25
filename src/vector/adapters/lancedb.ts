@@ -7,6 +7,18 @@
 
 import type { VectorStoreAdapter, VectorDocument, VectorQueryResult, EmbeddingProvider } from '../types.ts';
 
+const QUERY_TIMEOUT_MS = Number(process.env.ARRA_LANCEDB_QUERY_TIMEOUT_MS ?? 5_000);
+
+async function withQueryTimeout<T>(p: Promise<T>, label: string, ms: number = QUERY_TIMEOUT_MS): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`LanceDB ${label} timed out after ${ms}ms`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer!));
+}
+
 export class LanceDBAdapter implements VectorStoreAdapter {
   readonly name = 'lancedb';
   private db: any = null;
@@ -25,7 +37,7 @@ export class LanceDBAdapter implements VectorStoreAdapter {
     if (this.db) return;
 
     const lancedb = await import('@lancedb/lancedb');
-    this.db = await lancedb.connect(this.dbPath);
+    this.db = await withQueryTimeout(lancedb.connect(this.dbPath), 'connect');
     console.error(`[LanceDB] Connected at ${this.dbPath}`);
   }
 
@@ -38,18 +50,18 @@ export class LanceDBAdapter implements VectorStoreAdapter {
   async ensureCollection(): Promise<void> {
     if (!this.db) throw new Error('LanceDB not connected');
 
-    const tableNames = await this.db.tableNames();
+    const tableNames = await withQueryTimeout(this.db.tableNames(), 'tableNames');
     if (tableNames.includes(this.collectionName)) {
-      this.table = await this.db.openTable(this.collectionName);
+      this.table = await withQueryTimeout(this.db.openTable(this.collectionName), 'openTable');
     } else {
       // Create with a schema-defining dummy row, then delete it
       const dims = this.embedder.dimensions;
-      this.table = await this.db.createTable(this.collectionName, [{
+      this.table = await withQueryTimeout(this.db.createTable(this.collectionName, [{
         id: '__init__',
         text: '',
         metadata: '{}',
         vector: new Array(dims).fill(0),
-      }]);
+      }]), 'createTable');
       await this.table.delete('id = "__init__"');
     }
 
@@ -82,7 +94,7 @@ export class LanceDBAdapter implements VectorStoreAdapter {
     let fresh: number[][] = [];
     if (needEmbed.length > 0) {
       const texts = needEmbed.map(i => docs[i].document);
-      fresh = await this.embedder.embed(texts, 'passage');
+      fresh = await withQueryTimeout(this.embedder.embed(texts, 'passage'), 'embed-passage');
     }
     let freshIdx = 0;
 
@@ -93,7 +105,7 @@ export class LanceDBAdapter implements VectorStoreAdapter {
       vector: doc.vector ?? fresh[freshIdx++],
     }));
 
-    await this.table.add(rows);
+    await withQueryTimeout(this.table.add(rows), 'add');
     const reused = docs.length - needEmbed.length;
     if (reused > 0) {
       console.error(`[LanceDB] Added ${docs.length} documents (${reused} with precomputed vectors)`);
@@ -105,11 +117,14 @@ export class LanceDBAdapter implements VectorStoreAdapter {
   async query(text: string, limit: number = 10, where?: Record<string, any>): Promise<VectorQueryResult> {
     if (!this.table) await this.ensureCollection();
 
-    const [queryEmbedding] = await this.embedder.embed([text], 'query');
+    const [queryEmbedding] = await withQueryTimeout(this.embedder.embed([text], 'query'), 'embed-query');
 
     // Fetch extra results if filtering in JS (metadata is stored as string, not binary)
     const fetchLimit = where ? limit * 3 : limit;
-    const results = await this.table.search(queryEmbedding).distanceType('cosine').limit(fetchLimit).toArray();
+    const results = await withQueryTimeout(
+      this.table.search(queryEmbedding).distanceType('cosine').limit(fetchLimit).toArray(),
+      'search',
+    );
 
     // Filter metadata in JavaScript (LanceDB json_extract requires LargeBinary, not Utf8)
     let filtered = results;
@@ -132,13 +147,19 @@ export class LanceDBAdapter implements VectorStoreAdapter {
     if (!this.table) await this.ensureCollection();
 
     // Get the document's vector using filter query (not vector search)
-    const rows = await this.table.query().where(`id = '${id}'`).limit(1).toArray();
+    const rows = await withQueryTimeout(
+      this.table.query().where(`id = '${id}'`).limit(1).toArray(),
+      'query-by-id',
+    );
     if (rows.length === 0) {
       throw new Error(`No embedding found for document: ${id}`);
     }
 
     const vector = Array.from(rows[0].vector);
-    const results = await this.table.search(vector).distanceType('cosine').limit(nResults + 1).toArray();
+    const results = await withQueryTimeout(
+      this.table.search(vector).distanceType('cosine').limit(nResults + 1).toArray(),
+      'search-by-id',
+    );
 
     const filtered = results.filter((r: any) => r.id !== id).slice(0, nResults);
 
@@ -155,16 +176,16 @@ export class LanceDBAdapter implements VectorStoreAdapter {
       // Try to open existing table
       if (this.db) {
         try {
-          const tableNames = await this.db.tableNames();
+          const tableNames = await withQueryTimeout(this.db.tableNames(), 'getStats-tableNames');
           if (tableNames.includes(this.collectionName)) {
-            this.table = await this.db.openTable(this.collectionName);
+            this.table = await withQueryTimeout(this.db.openTable(this.collectionName), 'getStats-openTable');
           }
         } catch {}
       }
       if (!this.table) return { count: 0 };
     }
     try {
-      const count = await this.table.countRows();
+      const count = await withQueryTimeout(this.table.countRows(), 'countRows');
       return { count };
     } catch {
       return { count: 0 };
