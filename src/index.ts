@@ -74,6 +74,37 @@ const WRITE_TOOLS = [
   'arra_handoff',
 ];
 
+// Per-tool timeout (ms). Prevents indefinite hangs on any tool call, which
+// was the root cause of glueboy-oracle#38 (codex review hung indefinitely
+// when it called arra_search via MCP). Override via ARRA_MCP_TOOL_TIMEOUT_MS env.
+const TOOL_TIMEOUT_MS = Number(process.env.ARRA_MCP_TOOL_TIMEOUT_MS ?? 15_000);
+
+/**
+ * Race a tool handler against a timeout. If the timeout fires, the returned
+ * promise rejects — the caller's try/catch converts that to an MCP error
+ * response so the client sees a clean failure instead of an indefinite hang.
+ */
+async function withToolTimeout<T>(
+  promise: Promise<T>,
+  toolName: string,
+  timeoutMs: number = TOOL_TIMEOUT_MS,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`MCP tool ${toolName} timed out after ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 class OracleMCPServer {
   private server: Server;
   private sqlite: Database;
@@ -122,7 +153,11 @@ class OracleMCPServer {
 
     this.setupHandlers();
     this.setupErrorHandling();
-    this.verifyVectorHealth();
+    // NOTE: verifyVectorHealth() is intentionally NOT called here. The vector
+    // store hasn't connected yet — calling getStats() pre-connect always
+    // returns count=0 ("Connected but collection empty" spurious warning).
+    // main() invokes it AFTER preConnectVector() to get an accurate count.
+    // (glueboy-oracle#59 diagnostic 2026-05-25.)
   }
 
   /** Build ToolContext from server state */
@@ -232,53 +267,56 @@ class OracleMCPServer {
 
       const ctx = this.toolCtx;
 
+      // Each tool dispatch is wrapped in withToolTimeout to convert indefinite
+      // hangs into clean MCP error responses. Root cause of glueboy-oracle#38.
+      const toolName = request.params.name;
       try {
-        switch (request.params.name) {
+        switch (toolName) {
           // Core tools (delegated to src/tools/)
           case 'arra_search':
-            return await handleSearch(ctx, request.params.arguments as unknown as OracleSearchInput);
+            return await withToolTimeout(handleSearch(ctx, request.params.arguments as unknown as OracleSearchInput), toolName);
           case 'arra_read':
-            return await handleRead(ctx, request.params.arguments as unknown as OracleReadInput);
+            return await withToolTimeout(handleRead(ctx, request.params.arguments as unknown as OracleReadInput), toolName);
           case 'arra_learn':
-            return await handleLearn(ctx, request.params.arguments as unknown as OracleLearnInput);
+            return await withToolTimeout(handleLearn(ctx, request.params.arguments as unknown as OracleLearnInput), toolName);
           case 'arra_list':
-            return await handleList(ctx, request.params.arguments as unknown as OracleListInput);
+            return await withToolTimeout(handleList(ctx, request.params.arguments as unknown as OracleListInput), toolName);
           case 'arra_stats':
-            return await handleStats(ctx, request.params.arguments as unknown as OracleStatsInput);
+            return await withToolTimeout(handleStats(ctx, request.params.arguments as unknown as OracleStatsInput), toolName);
           case 'arra_concepts':
-            return await handleConcepts(ctx, request.params.arguments as unknown as OracleConceptsInput);
+            return await withToolTimeout(handleConcepts(ctx, request.params.arguments as unknown as OracleConceptsInput), toolName);
           case 'arra_supersede':
-            return await handleSupersede(ctx, request.params.arguments as unknown as OracleSupersededInput);
+            return await withToolTimeout(handleSupersede(ctx, request.params.arguments as unknown as OracleSupersededInput), toolName);
           case 'arra_handoff':
-            return await handleHandoff(ctx, request.params.arguments as unknown as OracleHandoffInput);
+            return await withToolTimeout(handleHandoff(ctx, request.params.arguments as unknown as OracleHandoffInput), toolName);
           case 'arra_inbox':
-            return await handleInbox(ctx, request.params.arguments as unknown as OracleInboxInput);
+            return await withToolTimeout(handleInbox(ctx, request.params.arguments as unknown as OracleInboxInput), toolName);
           // Forum tools (delegated to src/tools/forum.ts)
           case 'arra_thread':
-            return await handleThread(request.params.arguments as unknown as OracleThreadInput);
+            return await withToolTimeout(handleThread(request.params.arguments as unknown as OracleThreadInput), toolName);
           case 'arra_threads':
-            return await handleThreads(request.params.arguments as unknown as OracleThreadsInput);
+            return await withToolTimeout(handleThreads(request.params.arguments as unknown as OracleThreadsInput), toolName);
           case 'arra_thread_read':
-            return await handleThreadRead(request.params.arguments as unknown as OracleThreadReadInput);
+            return await withToolTimeout(handleThreadRead(request.params.arguments as unknown as OracleThreadReadInput), toolName);
           case 'arra_thread_update':
-            return await handleThreadUpdate(request.params.arguments as unknown as OracleThreadUpdateInput);
+            return await withToolTimeout(handleThreadUpdate(request.params.arguments as unknown as OracleThreadUpdateInput), toolName);
 
           // Trace tools (delegated to src/tools/trace.ts)
           case 'arra_trace':
-            return await handleTrace(request.params.arguments as unknown as CreateTraceInput);
+            return await withToolTimeout(handleTrace(request.params.arguments as unknown as CreateTraceInput), toolName);
           case 'arra_trace_list':
-            return await handleTraceList(request.params.arguments as unknown as ListTracesInput);
+            return await withToolTimeout(handleTraceList(request.params.arguments as unknown as ListTracesInput), toolName);
           case 'arra_trace_get':
-            return await handleTraceGet(request.params.arguments as unknown as GetTraceInput);
+            return await withToolTimeout(handleTraceGet(request.params.arguments as unknown as GetTraceInput), toolName);
           case 'arra_trace_link':
-            return await handleTraceLink(request.params.arguments as unknown as { prevTraceId: string; nextTraceId: string });
+            return await withToolTimeout(handleTraceLink(request.params.arguments as unknown as { prevTraceId: string; nextTraceId: string }), toolName);
           case 'arra_trace_unlink':
-            return await handleTraceUnlink(request.params.arguments as unknown as { traceId: string; direction: 'prev' | 'next' });
+            return await withToolTimeout(handleTraceUnlink(request.params.arguments as unknown as { traceId: string; direction: 'prev' | 'next' }), toolName);
           case 'arra_trace_chain':
-            return await handleTraceChain(request.params.arguments as unknown as { traceId: string });
+            return await withToolTimeout(handleTraceChain(request.params.arguments as unknown as { traceId: string }), toolName);
 
           default:
-            throw new Error(`Unknown tool: ${request.params.name}`);
+            throw new Error(`Unknown tool: ${toolName}`);
         }
       } catch (error) {
         return {
@@ -296,6 +334,11 @@ class OracleMCPServer {
     await this.vectorStore.connect();
   }
 
+  /** Public so main() can call it after preConnectVector completes (race fix glueboy-oracle#59). */
+  async runVectorHealthCheck(): Promise<void> {
+    await this.verifyVectorHealth();
+  }
+
   async run(): Promise<void> {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
@@ -303,7 +346,32 @@ class OracleMCPServer {
   }
 }
 
+/**
+ * --healthcheck mode: instantiate the server, attempt a synthetic check, exit cleanly.
+ * Used by deployment scripts to verify the MCP server can come up without hanging.
+ * Exits 0 on success, 1 on failure. Caller-side timeout (e.g. `timeout 10s`) recommended.
+ */
+async function runHealthcheck(): Promise<void> {
+  const HEALTHCHECK_TIMEOUT_MS = Number(process.env.ARRA_MCP_HEALTHCHECK_TIMEOUT_MS ?? 8_000);
+  try {
+    const server = new OracleMCPServer({ readOnly: true });
+    await withToolTimeout(server.preConnectVector(), 'healthcheck.preConnectVector', HEALTHCHECK_TIMEOUT_MS);
+    // Health check now reports accurate doc count (post-race-fix glueboy-oracle#59).
+    await withToolTimeout(server.runVectorHealthCheck(), 'healthcheck.runVectorHealthCheck', HEALTHCHECK_TIMEOUT_MS);
+    console.log('arra-oracle MCP healthcheck: OK');
+    process.exit(0);
+  } catch (e) {
+    console.error('arra-oracle MCP healthcheck: FAIL —', e instanceof Error ? e.message : String(e));
+    process.exit(1);
+  }
+}
+
 async function main() {
+  if (process.argv.includes('--healthcheck')) {
+    await runHealthcheck();
+    return; // unreachable; runHealthcheck calls process.exit
+  }
+
   const readOnly = process.env.ORACLE_READ_ONLY === 'true' || process.argv.includes('--read-only');
   const server = new OracleMCPServer({ readOnly });
 
@@ -311,6 +379,9 @@ async function main() {
     console.error('[Startup] Pre-connecting to vector store...');
     await server.preConnectVector();
     console.error('[Startup] Vector store pre-connected successfully');
+    // Now safe to verify health (vector store is connected).
+    // Was previously called from constructor, which raced ahead of preConnect.
+    await server.runVectorHealthCheck();
   } catch (e) {
     console.error('[Startup] Vector store pre-connect failed:', e instanceof Error ? e.message : e);
   }
